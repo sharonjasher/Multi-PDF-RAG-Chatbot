@@ -1,0 +1,123 @@
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from datetime import datetime
+
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.chat_models import ChatOpenAI
+from langchain.chains import RetrievalQA
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.docstore.document import Document
+
+# Load API key from .env
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Initialize LLM
+llm = ChatOpenAI(model="gpt-4o", temperature=0.5, openai_api_key=OPENAI_API_KEY)
+
+# Streamlit UI config
+st.set_page_config(page_title="📄 Multi-PDF RAG Chatbot", layout="wide")
+st.title("📄 Multi-PDF RAG Chatbot with GPT-4o")
+
+# Upload PDFs
+uploaded_files = st.file_uploader("Upload one or more PDF files", type=["pdf"], accept_multiple_files=True)
+
+# Extract text from uploaded PDFs
+def extract_text_from_pdfs(files):
+    combined_text = ""
+    for file in files:
+        try:
+            reader = PdfReader(file)
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                combined_text += page_text + "\n"
+        except Exception as e:
+            st.error(f"❌ Error reading {file.name}: {e}")
+    return combined_text
+
+# Create vector store with FAISS
+@st.cache_resource(show_spinner=False)
+def create_vectorstore(text):
+    try:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+        chunks = splitter.split_text(text)
+        docs = [Document(page_content=chunk) for chunk in chunks]
+        embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        vectorstore = FAISS.from_documents(docs, embeddings)
+        return vectorstore
+    except Exception as e:
+        st.error(f"❌ Vector store error: {e}")
+        return None
+
+# Initialize chat history
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# Create vector store from uploaded files
+if uploaded_files:
+    with st.spinner("📖 Reading and indexing PDFs..."):
+        full_text = extract_text_from_pdfs(uploaded_files)
+
+    if full_text.strip():
+        vectorstore = create_vectorstore(full_text)
+
+        if vectorstore:
+            qa_chain = RetrievalQA.from_chain_type(
+                llm=llm,
+                retriever=vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4}),
+                return_source_documents=True
+            )
+
+            st.success("✅ PDFs indexed. You can now ask questions.")
+
+            # Input box
+            query = st.text_input("💬 Ask a question about the uploaded PDFs:")
+
+            if query:
+                with st.spinner("🤖 Generating answer..."):
+                    try:
+                        response = qa_chain.invoke({"query": query})
+                        answer = response["result"]
+                        sources = response["source_documents"]
+
+                        # Store Q&A in session
+                        st.session_state.chat_history.append({
+                            "query": query,
+                            "answer": answer,
+                            "sources": sources
+                        })
+
+                        st.write("### 🤖 Answer:")
+                        st.write(answer)
+
+                        with st.expander("📚 Source Chunks"):
+                            for i, doc in enumerate(sources):
+                                st.markdown(f"**Source {i+1}:**")
+                                st.write(doc.page_content)
+
+                    except Exception as e:
+                        st.error(f"❌ Chain error: {e}")
+
+# Show history
+if st.session_state.chat_history:
+    st.write("---")
+    st.subheader("🕒 Chat History")
+    for i, turn in enumerate(st.session_state.chat_history):
+        st.markdown(f"**Q{i+1}:** {turn['query']}")
+        st.markdown(f"**A{i+1}:** {turn['answer']}")
+
+    # Download chat history
+    chat_log = "\n\n".join([
+        f"Q{i+1}: {turn['query']}\nA{i+1}: {turn['answer']}"
+        for i, turn in enumerate(st.session_state.chat_history)
+    ])
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    st.download_button(
+        label="📥 Download Q&A Log",
+        data=chat_log,
+        file_name=f"qa_chat_{timestamp}.txt",
+        mime="text/plain"
+    )
